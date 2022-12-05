@@ -12,28 +12,30 @@ import traceback
 from collections import Counter, defaultdict
 from io import StringIO
 
-# Global variables
-config = None
-email_log = None
 
+
+# tee logs seems to log the snapraid command output to a file, snazzy and useful.
 
 def tee_log(infile, out_lines, log_level):
     """
     Create a thread that saves all the output on infile to out_lines and
     logs every line with log_level
     """
+
     def tee_thread():
         for line in iter(infile.readline, ""):
             logging.log(log_level, line.rstrip())
             out_lines.append(line)
         infile.close()
+
     t = threading.Thread(target=tee_thread)
     t.daemon = True
     t.start()
     return t
 
 
-def snapraid_command(command, args={}, *, allow_statuscodes=[]):
+# Runs the snapraid command, parses together the line to run it.
+def snapraid_command(command, args={}, *, allow_statuscodes=[], config):
     """
     Run snapraid command
     Raises subprocess.CalledProcessError if errorlevel != 0
@@ -48,6 +50,7 @@ def snapraid_command(command, args={}, *, allow_statuscodes=[]):
         stderr=subprocess.PIPE,
         # Snapraid always outputs utf-8 on windows. On linux, utf-8
         # also seems a sensible assumption.
+        # linux uses utf-8 encoding by default? eh what do I know.
         encoding="utf-8",
         errors="replace")
     out = []
@@ -65,84 +68,126 @@ def snapraid_command(command, args={}, *, allow_statuscodes=[]):
         raise subprocess.CalledProcessError(ret, "snapraid " + command)
 
 
-def send_email(success):
-    import smtplib
-    from email.mime.text import MIMEText
-    from email import charset
-
-    if len(config["smtp"]["host"]) == 0:
-        logging.error("Failed to send email because smtp host is not set")
-        return
-
-    # use quoted-printable instead of the default base64
-    charset.add_charset("utf-8", charset.SHORTEST, charset.QP)
-    if success:
+# Sends the email
+def send_remote_message(proc_state,remote_log,config):
+    if proc_state:
         body = "SnapRAID job completed successfully:\n\n\n"
     else:
         body = "Error during SnapRAID job:\n\n\n"
 
-    log = email_log.getvalue()
-    maxsize = config['email'].get('maxsize', 500) * 1024
-    if maxsize and len(log) > maxsize:
-        cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
-        log = (
-            "NOTE: Log was too big for email and was shortened\n\n" +
-            log[:maxsize // 2] +
-            "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
-                cut_lines) +
-            log[-maxsize // 2:])
-    body += log
+    log = remote_log.getvalue()
 
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = config["email"]["subject"] + \
-        (" SUCCESS" if success else " ERROR")
-    msg["From"] = config["email"]["from"]
-    msg["To"] = config["email"]["to"]
-    smtp = {"host": config["smtp"]["host"]}
-    if config["smtp"]["port"]:
-        smtp["port"] = config["smtp"]["port"]
-    if config["smtp"]["ssl"]:
-        server = smtplib.SMTP_SSL(**smtp)
-    else:
-        server = smtplib.SMTP(**smtp)
-        if config["smtp"]["tls"]:
-            server.starttls()
-    if config["smtp"]["user"]:
-        server.login(config["smtp"]["user"], config["smtp"]["password"])
-    server.sendmail(
-        config["email"]["from"],
-        [config["email"]["to"]],
-        msg.as_string())
-    server.quit()
+    if config["smtp"]["enabled"]:
+        import smtplib
+        from email.mime.text import MIMEText
+        from email import charset
+
+        if len(config["smtp"]["host"]) == 0:
+            logging.error("Failed to send email because smtp host is not set")
+            return
+
+        # use quoted-printable instead of the default base64
+        charset.add_charset("utf-8", charset.SHORTEST, charset.QP)
+
+        maxsize = config['email'].get('maxsize', 500) * 1024
+        if maxsize and len(log) > maxsize:
+            cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
+            log = (
+                    "NOTE: Log was too big for email and was shortened\n\n" +
+                    log[:maxsize // 2] +
+                    "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
+                        cut_lines) +
+                    log[-maxsize // 2:])
+        body += log
+
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = config["email"]["subject"] + \
+                         (" SUCCESS" if proc_state else " ERROR")
+        msg["From"] = config["email"]["from"]
+        msg["To"] = config["email"]["to"]
+        smtp = {"host": config["smtp"]["host"]}
+        if config["smtp"]["port"]:
+            smtp["port"] = config["smtp"]["port"]
+        if config["smtp"]["ssl"]:
+            server = smtplib.SMTP_SSL(**smtp)
+        else:
+            server = smtplib.SMTP(**smtp)
+            if config["smtp"]["tls"]:
+                server.starttls()
+        if config["smtp"]["user"]:
+            server.login(config["smtp"]["user"], config["smtp"]["password"])
+        server.sendmail(
+            config["email"]["from"],
+            [config["email"]["to"]],
+            msg.as_string())
+        server.quit()
+    elif config["discord"]["enabled"]:
+
+        """
+        maxsize = 2000
+        if maxsize and len(log) > maxsize:
+            cut_lines = log.count("\n", maxsize // 2, -maxsize // 2)
+            log = (
+                    "NOTE: Log was too big for email and was shortened\n\n" +
+                    log[:maxsize // 2] +
+                    "[...]\n\n\n --- LOG WAS TOO BIG - {} LINES REMOVED --\n\n\n[...]".format(
+                        cut_lines) +
+                    log[-maxsize // 2:])
+        """
 
 
-def finish(is_success):
-    if ("error", "success")[is_success] in config["email"]["sendon"]:
+
+
+        body += log
+        botsendmessage(log)
+
+
+
+def botsendsmessage(message):
+    import bot
+
+    sendmessage(message)
+
+
+# The function that handles the bool value of the main program
+# Results are sent to logs and email, email function is called here.
+def finish(proc_state,config):
+    if ("error", "success")[proc_state] in config["email"]["sendon"]:
         try:
-            send_email(is_success)
+            send_email(proc_state)
         except Exception:
             logging.exception("Failed to send email")
-    if is_success:
+    if config["discord bot"]["enabled"]:
+        try:
+            botsendsmessage()
+        except Exception:
+            logging.exception("Failed to send message through bot. Check bot logs.")
+    if proc_state:
         logging.info("Run finished successfully")
     else:
         logging.error("Run failed")
-    sys.exit(0 if is_success else 1)
+    sys.exit(0 if proc_state else 1)
 
 
-def load_config(args):
-    global config
+# Loads config file
+def load_config(args,config):
     parser = configparser.RawConfigParser()
     parser.read(args.conf)
-    sections = ["snapraid", "logging", "email", "smtp", "scrub"]
+    sections = ["snapraid", "logging", "email", "smtp", "scrub", "discord bot"]
     config = dict((x, defaultdict(lambda: "")) for x in sections)
     for section in parser.sections():
         for (k, v) in parser.items(section):
             config[section][k] = v.strip()
 
+    # Variable list?
+
     int_options = [
         ("snapraid", "deletethreshold"), ("logging", "maxsize"),
         ("scrub", "older-than"), ("email", "maxsize"),
     ]
+
+    # Sets default values if they are incorrectly set, or not set to begin with.
+
     for section, option in int_options:
         try:
             config[section][option] = int(config[section][option])
@@ -166,7 +211,7 @@ def load_config(args):
         config["snapraid"]["deletethreshold"] = -1
 
 
-def setup_logger():
+def setup_logger(config):
     log_format = logging.Formatter(
         "%(asctime)s [%(levelname)-6.6s] %(message)s")
     root_logger = logging.getLogger()
@@ -189,17 +234,24 @@ def setup_logger():
         root_logger.addHandler(file_logger)
 
     if config["email"]["sendon"]:
-        global email_log
-        email_log = StringIO()
-        email_logger = logging.StreamHandler(email_log)
+        global remote_log
+        remote_log = StringIO()
+        email_logger = logging.StreamHandler(remote_log)
         email_logger.setFormatter(log_format)
         if config["email"]["short"]:
             # Don't send programm stdout in email
             email_logger.setLevel(logging.INFO)
         root_logger.addHandler(email_logger)
 
+    if config["discord bot"]["enabled"]:
+        bot_log = StringIO()
+        bot_logger = logging.StreamHandler(bot_log)
+        bot_logger.setFormatter(log_format)
+        root_logger.addHandler(bot_logger)
 
 def main():
+    config = None
+    email_log = None
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--conf",
                         default="snapraid-runner.conf",
@@ -218,27 +270,27 @@ def main():
         sys.exit(2)
 
     try:
-        load_config(args)
+        load_config(args,config)
     except Exception:
         print("unexpected exception while loading config")
         print(traceback.format_exc())
         sys.exit(2)
 
     try:
-        setup_logger()
+        setup_logger(config)
     except Exception:
         print("unexpected exception while setting up logging")
         print(traceback.format_exc())
         sys.exit(2)
 
     try:
-        run()
+        run(config)
     except Exception:
         logging.exception("Run failed due to unexpected exception:")
-        finish(False)
+        finish(False,config)
 
 
-def run():
+def run(config):
     logging.info("=" * 60)
     logging.info("Run started")
     logging.info("=" * 60)
@@ -246,12 +298,12 @@ def run():
     if not os.path.isfile(config["snapraid"]["executable"]):
         logging.error("The configured snapraid executable \"{}\" does not "
                       "exist or is not a file".format(
-                          config["snapraid"]["executable"]))
-        finish(False)
+            config["snapraid"]["executable"]))
+        finish(False,config)
     if not os.path.isfile(config["snapraid"]["config"]):
         logging.error("Snapraid config does not exist at " +
                       config["snapraid"]["config"])
-        finish(False)
+        finish(False,config)
 
     if config["snapraid"]["touch"]:
         logging.info("Running touch...")
@@ -274,7 +326,7 @@ def run():
             "Deleted files exceed delete threshold of {}, aborting".format(
                 config["snapraid"]["deletethreshold"]))
         logging.error("Run again with --ignore-deletethreshold to sync anyways")
-        finish(False)
+        finish(False,config)
 
     if (diff_results["remove"] + diff_results["add"] + diff_results["move"] +
             diff_results["update"] == 0):
@@ -285,7 +337,7 @@ def run():
             snapraid_command("sync")
         except subprocess.CalledProcessError as e:
             logging.error(e)
-            finish(False)
+            finish(False,config)
         logging.info("*" * 60)
 
     if config["scrub"]["enabled"]:
@@ -304,11 +356,11 @@ def run():
             snapraid_command("scrub", scrub_args)
         except subprocess.CalledProcessError as e:
             logging.error(e)
-            finish(False)
+            finish(False,config)
         logging.info("*" * 60)
 
     logging.info("All done")
-    finish(True)
+    finish(True,config)
 
 
 main()

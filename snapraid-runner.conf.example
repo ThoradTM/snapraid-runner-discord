@@ -15,6 +15,8 @@ file = snapraid.log
 maxsize = 5000
 
 [email]
+; enable or disable
+enabled = false
 ; when to send an email, comma-separated list of [success, error]
 sendon = success,error
 ; set to false to get full programm output via email
@@ -42,3 +44,8 @@ enabled = false
 plan = 12
 ; minimum block age (in days) for scrubbing. Only used with percentage plans
 older-than = 10
+
+[discord bot]
+; set to true to enable discord bot functionality
+enabled = true
+
